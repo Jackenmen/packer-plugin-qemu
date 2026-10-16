@@ -19,6 +19,7 @@ import (
 	"unicode"
 
 	"github.com/hashicorp/packer-plugin-sdk/multistep"
+	packersdk "github.com/hashicorp/packer-plugin-sdk/packer"
 )
 
 type DriverCancelCallback func(state multistep.StateBag) bool
@@ -65,8 +66,41 @@ func (d *QemuDriver) Stop() error {
 	defer d.lock.Unlock()
 
 	if d.vmCmd != nil {
-		if err := d.vmCmd.Process.Kill(); err != nil {
+		p := d.vmCmd.Process
+
+		done := make(chan error, 1)
+		go func() {
+			_, err := p.Wait()
+			if sysErr, ok := err.(*os.SyscallError); ok {
+				if sysErr.Err == syscall.ECHILD {
+					err = nil
+				}
+			}
+			done <- err
+		}()
+
+		if err := terminateProcess(p); err != nil && err != os.ErrProcessDone {
 			return err
+		}
+
+		var errs *packersdk.MultiError
+		select {
+		case err := <-done:
+			if err != nil {
+				errs = packersdk.MultiErrorAppend(errs, err)
+				if err := p.Kill(); err != nil && err != os.ErrProcessDone {
+					errs = packersdk.MultiErrorAppend(errs, err)
+				}
+			}
+		case <-time.After(15 * time.Second):
+			if err := p.Kill(); err != nil && err != os.ErrProcessDone {
+				errs = packersdk.MultiErrorAppend(errs, err)
+			}
+			<-done
+		}
+
+		if errs != nil && len(errs.Errors) > 0 {
+			return errs
 		}
 	}
 
@@ -115,6 +149,8 @@ func (d *QemuDriver) Qemu(qemuArgs ...string) error {
 	cmd := exec.Command(d.QemuPath, qemuArgs...)
 	cmd.Stdout = stdout_w
 	cmd.Stderr = stderr_w
+	// on Windows, we need a dedicated process group to be able to target it with Ctrl+C
+	setNewProcessGroup(cmd)
 
 	err := cmd.Start()
 	if err != nil {
